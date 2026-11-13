@@ -1,0 +1,6 @@
+{
+  "name": "MediScan AI",
+  "description": "Intelligent Medical Report & Imaging Analyzer helping people understand Blood Reports, X-rays, and MRI scans in clear, simple language.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
