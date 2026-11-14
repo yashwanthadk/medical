@@ -2,16 +2,12 @@ import 'dotenv/config';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
-import multer from 'multer';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, VAULT_DIRECTORY } from './server/db.ts';
+import { db } from './server/db.ts';
 import type { DbReportRow, DbUserRow } from './server/db.ts';
 import {
-  decryptBuffer,
-  encryptBuffer,
   generateOpaqueToken,
   getSessionSecret,
   hashPassword,
@@ -24,9 +20,26 @@ import {
   GeminiServiceError,
   isAiConfigured,
 } from './server/gemini.ts';
+import { generateServerMedicalPdfBuffer } from './server/pdfGenerator.ts';
+import {
+  acquireInFlightLock,
+  createRateLimiter,
+  releaseInFlightLock,
+} from './server/rateLimit.ts';
+import {
+  extractPdfTextServer,
+  handleSingleFileUpload,
+  readDecryptedVaultFile,
+  sanitizeFilename,
+  storeEncryptedVaultFile,
+  unlinkVaultFile,
+  UploadValidationError,
+  validateUploadedMedicalFile,
+} from './server/upload.ts';
 import type {
   AuthUser,
   MedicalAnalysisResult,
+  MedicalReportRecord,
   ModuleType,
   PatientContext,
   SubType,
@@ -38,15 +51,22 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const SESSION_COOKIE_NAME = 'mediscan_sid';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
+const MEDICAL_DISCLAIMER = 'Educational information only. Not a medical diagnosis.';
 
 interface AuthedRequest extends Request {
   authUser?: AuthUser;
 }
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_UPLOAD_BYTES },
+const authRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 30,
+  keyPrefix: 'auth',
+});
+
+const analysisRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 20,
+  keyPrefix: 'analysis',
 });
 
 function toPublicUser(row: DbUserRow): AuthUser {
@@ -137,67 +157,12 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): voi
   if (!user) {
     res.status(401).json({
       code: 'AUTH_REQUIRED',
-      error: 'Your session expired or is missing. Please sign in again.',
+      error: 'Authentication required. Please sign in.',
     });
     return;
   }
   req.authUser = user;
   next();
-}
-
-function handleSingleFileUpload(req: Request, res: Response, next: NextFunction): void {
-  upload.single('file')(req, res, (err: unknown) => {
-    if (!err) {
-      next();
-      return;
-    }
-    if (err instanceof multer.MulterError) {
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        res.status(413).json({
-          code: 'FILE_TOO_LARGE',
-          error: 'Uploaded file is too large. Maximum allowed size is 15 MB.',
-        });
-        return;
-      }
-      res.status(400).json({
-        code: 'UPLOAD_ERROR',
-        error: `Upload failed: ${err.message}`,
-      });
-      return;
-    }
-    console.error('[Upload Middleware Error]', err);
-    res.status(400).json({
-      code: 'UPLOAD_ERROR',
-      error: 'Unable to process uploaded file. Please try selecting the file again.',
-    });
-  });
-}
-
-function detectFileSignature(buffer: Buffer): 'application/pdf' | 'image/jpeg' | 'image/png' | null {
-  if (buffer.length < 8) return null;
-  if (buffer.subarray(0, 5).toString('ascii') === '%PDF-') {
-    return 'application/pdf';
-  }
-  if (
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47 &&
-    buffer[4] === 0x0d &&
-    buffer[5] === 0x0a &&
-    buffer[6] === 0x1a &&
-    buffer[7] === 0x0a
-  ) {
-    return 'image/png';
-  }
-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  return null;
-}
-
-function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120) || 'medical-report';
 }
 
 function validateEmail(email: string): boolean {
@@ -216,6 +181,40 @@ function extractPatientContext(body: Record<string, unknown>, fallbackName: stri
   };
 }
 
+function toReportRecord(row: DbReportRow): MedicalReportRecord {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    moduleType: row.module_type as ModuleType,
+    subType: row.sub_type as SubType,
+    patientName: row.patient_name,
+    patientAge: row.patient_age,
+    patientSex: row.patient_sex,
+    reportDateLabel: row.report_date_label,
+    clinicalNotes: row.clinical_notes,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    fileSize: row.file_size,
+    status: row.status as MedicalAnalysisResult['overallStatus'],
+    analysis: JSON.parse(row.analysis_json) as MedicalAnalysisResult,
+    createdAt: row.created_at,
+  };
+}
+
+function formatStandardResults(analysis: MedicalAnalysisResult) {
+  return {
+    keyObservations: analysis.keyObservations,
+    normalFindings: analysis.normalFindings,
+    flaggedFindings: analysis.abnormalFindings,
+    explanation: analysis.simpleExplanation,
+    imageQuality: `${analysis.qualityAssessment.rating.toUpperCase()}: ${analysis.qualityAssessment.details}`,
+    limitations: analysis.limitations,
+    finalSummary: analysis.finalSummary,
+    bloodParameters: analysis.bloodParameters,
+    imagingObservations: analysis.imagingObservations,
+  };
+}
+
 function saveEncryptedReport(params: {
   userId: string;
   moduleType: ModuleType;
@@ -227,9 +226,7 @@ function saveEncryptedReport(params: {
   analysis: MedicalAnalysisResult;
 }): string {
   const reportId = crypto.randomUUID();
-  const vaultFileName = `${reportId}.enc`;
-  const { ciphertext, iv, authTag } = encryptBuffer(params.fileBuffer);
-  fs.writeFileSync(path.join(VAULT_DIRECTORY, vaultFileName), ciphertext, { mode: 0o600 });
+  const { vaultFileName, iv, authTag } = storeEncryptedVaultFile(reportId, params.fileBuffer);
 
   const now = new Date().toISOString();
   db.prepare(
@@ -263,24 +260,48 @@ function saveEncryptedReport(params: {
   return reportId;
 }
 
-function unlinkVaultFile(vaultFileName: string): void {
-  const safeName = path.basename(vaultFileName);
-  const fullPath = path.join(VAULT_DIRECTORY, safeName);
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
+function getOwnedReportOrError(
+  reportId: string,
+  userId: string,
+  res: Response,
+  expectedModule?: ModuleType,
+): DbReportRow | null {
+  const row = db
+    .prepare('SELECT * FROM reports WHERE id = ?')
+    .get(reportId) as DbReportRow | undefined;
+
+  if (!row) {
+    res.status(404).json({ code: 'NOT_FOUND', error: 'Medical report not found.' });
+    return null;
   }
+  if (row.user_id !== userId) {
+    res.status(403).json({ code: 'FORBIDDEN', error: 'Access denied to another user’s medical report.' });
+    return null;
+  }
+  if (expectedModule && row.module_type !== expectedModule) {
+    res.status(404).json({ code: 'NOT_FOUND', error: `No ${expectedModule} analysis found for this ID.` });
+    return null;
+  }
+  return row;
 }
 
 function sendAnalysisError(res: Response, label: string, error: unknown): void {
-  if (error instanceof GeminiServiceError) {
-    console.error(`[${label}] ${error.code}: ${error.message}`);
+  if (error instanceof UploadValidationError) {
     res.status(error.httpStatus).json({
       code: error.code,
       error: error.message,
     });
     return;
   }
-  console.error(`[${label} Unexpected Error]`, error);
+  if (error instanceof GeminiServiceError) {
+    console.error(`[${label}]`, { code: error.code, status: error.httpStatus });
+    res.status(error.httpStatus).json({
+      code: error.code,
+      error: error.message,
+    });
+    return;
+  }
+  console.error(`[${label} Unexpected Error]`, error instanceof Error ? error.name : 'UnknownError');
   res.status(500).json({
     code: 'SERVER_ERROR',
     error: 'Unexpected server error while processing your medical report. Please try again.',
@@ -291,7 +312,6 @@ async function startServer(): Promise<void> {
   const app = express();
   app.set('trust proxy', 1);
 
-  // CORS support for preview proxies and multi-origin clients
   app.use((req, res, next) => {
     const origin = req.headers.origin;
     if (origin) {
@@ -320,7 +340,7 @@ async function startServer(): Promise<void> {
 
   // --- AUTHENTICATION ROUTES ---
 
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', authRateLimiter, (req, res) => {
     const fullName = String(req.body?.fullName || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
@@ -375,8 +395,8 @@ async function startServer(): Promise<void> {
     );
 
     const sessionToken = createSessionForUser(req, res, userId);
-
     const createdRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as DbUserRow;
+
     res.status(201).json({
       user: toPublicUser(createdRow),
       sessionToken,
@@ -385,7 +405,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', authRateLimiter, (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const password = String(req.body?.password || '');
 
@@ -416,7 +436,7 @@ async function startServer(): Promise<void> {
   app.get('/api/auth/me', (req, res) => {
     const user = getAuthenticatedUser(req);
     if (!user) {
-      res.status(401).json({ error: 'Not authenticated' });
+      res.status(401).json({ code: 'AUTH_REQUIRED', error: 'Not authenticated' });
       return;
     }
     res.json({ user, aiConfigured: isAiConfigured() });
@@ -474,7 +494,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.post('/api/auth/forgot-password', (req, res) => {
+  app.post('/api/auth/forgot-password', authRateLimiter, (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     if (!validateEmail(email)) {
       res.status(400).json({ error: 'Please enter a valid email address.' });
@@ -503,7 +523,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.post('/api/auth/reset-password', (req, res) => {
+  app.post('/api/auth/reset-password', authRateLimiter, (req, res) => {
     const token = String(req.body?.token || '').trim();
     const newPassword = String(req.body?.newPassword || '');
     const confirmPassword = String(req.body?.confirmPassword || '');
@@ -608,7 +628,7 @@ async function startServer(): Promise<void> {
     res.json({ ok: true, message: 'Account and all encrypted medical records have been permanently deleted.' });
   });
 
-  // --- MEDICAL REPORT & ANALYSIS ROUTES ---
+  // --- REPORTS & PDF ROUTES ---
 
   app.get('/api/reports', requireAuth, (req: AuthedRequest, res) => {
     const user = req.authUser!;
@@ -638,56 +658,26 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/reports/:id', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    const row = db
-      .prepare('SELECT * FROM reports WHERE id = ? AND user_id = ?')
-      .get(req.params.id, user.id) as DbReportRow | undefined;
-
-    if (!row) {
-      res.status(404).json({ error: 'Medical report not found or access denied.' });
-      return;
-    }
-
+    const row = getOwnedReportOrError(req.params.id, req.authUser!.id, res);
+    if (!row) return;
+    const report = toReportRecord(row);
     res.json({
-      report: {
-        id: row.id,
-        userId: row.user_id,
-        moduleType: row.module_type,
-        subType: row.sub_type,
-        patientName: row.patient_name,
-        patientAge: row.patient_age,
-        patientSex: row.patient_sex,
-        reportDateLabel: row.report_date_label,
-        clinicalNotes: row.clinical_notes,
-        fileName: row.file_name,
-        mimeType: row.mime_type,
-        fileSize: row.file_size,
-        status: row.status,
-        analysis: JSON.parse(row.analysis_json) as MedicalAnalysisResult,
-        createdAt: row.created_at,
-      },
+      success: true,
+      report,
+      results: formatStandardResults(report.analysis),
+      medicalDisclaimer: MEDICAL_DISCLAIMER,
     });
   });
 
   app.get('/api/reports/:id/file', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    const row = db
-      .prepare('SELECT * FROM reports WHERE id = ? AND user_id = ?')
-      .get(req.params.id, user.id) as DbReportRow | undefined;
+    const row = getOwnedReportOrError(req.params.id, req.authUser!.id, res);
+    if (!row) return;
 
-    if (!row) {
-      res.status(404).json({ error: 'File not found or access denied.' });
+    const plaintext = readDecryptedVaultFile(row.vault_file_name, row.file_iv, row.file_auth_tag);
+    if (!plaintext) {
+      res.status(404).json({ code: 'NOT_FOUND', error: 'Encrypted file payload missing from vault.' });
       return;
     }
-
-    const safePath = path.join(VAULT_DIRECTORY, path.basename(row.vault_file_name));
-    if (!fs.existsSync(safePath)) {
-      res.status(404).json({ error: 'Encrypted file payload missing from vault.' });
-      return;
-    }
-
-    const ciphertext = fs.readFileSync(safePath);
-    const plaintext = decryptBuffer(ciphertext, row.file_iv, row.file_auth_tag);
 
     res.setHeader('Content-Type', row.mime_type);
     res.setHeader('Content-Disposition', `inline; filename="${row.file_name}"`);
@@ -696,228 +686,292 @@ async function startServer(): Promise<void> {
     res.send(plaintext);
   });
 
-  app.delete('/api/reports/:id', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.authUser!;
-    const row = db
-      .prepare('SELECT id, vault_file_name FROM reports WHERE id = ? AND user_id = ?')
-      .get(req.params.id, user.id) as { id: string; vault_file_name: string } | undefined;
+  app.get('/api/reports/:id/pdf', requireAuth, (req: AuthedRequest, res) => {
+    const row = getOwnedReportOrError(req.params.id, req.authUser!.id, res);
+    if (!row) return;
 
-    if (!row) {
-      res.status(404).json({ error: 'Medical report not found or access denied.' });
-      return;
-    }
+    const report = toReportRecord(row);
+    const pdfBuffer = generateServerMedicalPdfBuffer(report);
+    const baseName = report.fileName.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    unlinkVaultFile(row.vault_file_name);
-    db.prepare('DELETE FROM reports WHERE id = ? AND user_id = ?').run(row.id, user.id);
-    res.json({ ok: true });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="MediScan_Summary_${baseName}.pdf"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(pdfBuffer);
   });
 
-  app.post(
-    '/api/analyze/blood',
-    requireAuth,
-    handleSingleFileUpload,
-    async (req: AuthedRequest, res) => {
-      try {
-        if (!isAiConfigured()) {
-          res.status(503).json({
-            code: 'AI_NOT_CONFIGURED',
-            error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
-          });
-          return;
-        }
+  app.delete('/api/reports/:id', requireAuth, (req: AuthedRequest, res) => {
+    const row = getOwnedReportOrError(req.params.id, req.authUser!.id, res);
+    if (!row) return;
 
-        const file = req.file;
-        if (!file) {
-          res.status(400).json({
-            code: 'MISSING_FILE',
-            error: 'No file received by server. Please upload a Blood Report (PDF, JPG, JPEG, or PNG).',
-          });
-          return;
-        }
+    unlinkVaultFile(row.vault_file_name);
+    db.prepare('DELETE FROM reports WHERE id = ? AND user_id = ?').run(row.id, req.authUser!.id);
+    res.json({ success: true, ok: true });
+  });
 
-        const detectedMime = detectFileSignature(file.buffer);
-        if (!detectedMime) {
-          res.status(400).json({
-            code: 'UNSUPPORTED_FORMAT',
-            error: 'Unsupported or corrupted file format. Only valid PDF, JPG, JPEG, or PNG files are accepted.',
-          });
-          return;
-        }
+  // --- DEDICATED ANALYSIS HANDLERS (supporting both /api/analyze/* and /api/analysis/*) ---
 
-        const patientContext = extractPatientContext(
-          req.body as Record<string, unknown>,
-          req.authUser!.fullName,
-        );
-        const extractedPdfText = String(req.body?.extractedPdfText || '');
+  const handleBloodAnalysis = async (req: AuthedRequest, res: Response) => {
+    let lockKey: string | null = null;
+    try {
+      const validated = validateUploadedMedicalFile(req.file, [
+        'application/pdf',
+        'image/jpeg',
+        'image/png',
+      ]);
 
-        const analysis = await analyzeBloodReport({
-          fileBuffer: file.buffer,
-          mimeType: detectedMime,
-          extractedPdfText,
-          patientContext,
+      if (!isAiConfigured()) {
+        res.status(503).json({
+          code: 'AI_NOT_CONFIGURED',
+          error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
         });
-
-        const reportId = saveEncryptedReport({
-          userId: req.authUser!.id,
-          moduleType: 'blood',
-          subType: 'blood_panel',
-          patientContext,
-          fileName: file.originalname,
-          mimeType: detectedMime,
-          fileBuffer: file.buffer,
-          analysis,
-        });
-
-        res.status(201).json({ reportId, analysis });
-      } catch (error) {
-        sendAnalysisError(res, 'Blood Analysis', error);
+        return;
       }
-    },
-  );
 
-  app.post(
-    '/api/analyze/xray',
-    requireAuth,
-    handleSingleFileUpload,
-    async (req: AuthedRequest, res) => {
-      try {
-        if (!isAiConfigured()) {
-          res.status(503).json({
-            code: 'AI_NOT_CONFIGURED',
-            error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
-          });
-          return;
-        }
-
-        const file = req.file;
-        if (!file) {
-          res.status(400).json({
-            code: 'MISSING_FILE',
-            error: 'No file received by server. Please upload an X-ray image (JPG, JPEG, or PNG).',
-          });
-          return;
-        }
-
-        const detectedMime = detectFileSignature(file.buffer);
-        if (detectedMime !== 'image/jpeg' && detectedMime !== 'image/png') {
-          res.status(400).json({
-            code: 'UNSUPPORTED_FORMAT',
-            error: 'Unsupported image format. X-ray analysis accepts JPG, JPEG, or PNG images only.',
-          });
-          return;
-        }
-
-        const rawSubType = String(req.body?.subType || '');
-        if (rawSubType !== 'bone_xray' && rawSubType !== 'chest_xray') {
-          res.status(400).json({
-            code: 'INVALID_CATEGORY',
-            error: 'Please choose either Bone X-ray or Chest X-ray.',
-          });
-          return;
-        }
-
-        const patientContext = extractPatientContext(
-          req.body as Record<string, unknown>,
-          req.authUser!.fullName,
-        );
-        const analysis = await analyzeMedicalImage({
-          fileBuffer: file.buffer,
-          mimeType: detectedMime,
-          subType: rawSubType,
-          patientContext,
+      lockKey = `${req.authUser!.id}:blood:${validated.sha256}`;
+      if (!acquireInFlightLock(lockKey)) {
+        res.status(409).json({
+          code: 'DUPLICATE_REQUEST',
+          error: 'This exact blood report is already being analyzed. Please wait for it to complete.',
         });
-
-        const reportId = saveEncryptedReport({
-          userId: req.authUser!.id,
-          moduleType: 'xray',
-          subType: rawSubType,
-          patientContext,
-          fileName: file.originalname,
-          mimeType: detectedMime,
-          fileBuffer: file.buffer,
-          analysis,
-        });
-
-        res.status(201).json({ reportId, analysis });
-      } catch (error) {
-        sendAnalysisError(res, 'X-ray Analysis', error);
+        return;
       }
-    },
-  );
 
-  app.post(
-    '/api/analyze/mri',
-    requireAuth,
-    handleSingleFileUpload,
-    async (req: AuthedRequest, res) => {
-      try {
-        if (!isAiConfigured()) {
-          res.status(503).json({
-            code: 'AI_NOT_CONFIGURED',
-            error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
-          });
-          return;
-        }
+      const patientContext = extractPatientContext(
+        req.body as Record<string, unknown>,
+        req.authUser!.fullName,
+      );
 
-        const file = req.file;
-        if (!file) {
-          res.status(400).json({
-            code: 'MISSING_FILE',
-            error: 'No file received by server. Please upload an MRI scan image (JPG, JPEG, or PNG).',
-          });
-          return;
-        }
-
-        const detectedMime = detectFileSignature(file.buffer);
-        if (detectedMime !== 'image/jpeg' && detectedMime !== 'image/png') {
-          res.status(400).json({
-            code: 'UNSUPPORTED_FORMAT',
-            error: 'Unsupported image format. MRI analysis accepts JPG, JPEG, or PNG images only.',
-          });
-          return;
-        }
-
-        const rawSubType = String(req.body?.subType || '');
-        if (
-          rawSubType !== 'brain_mri' &&
-          rawSubType !== 'muscle_mri' &&
-          rawSubType !== 'soft_tissue_mri'
-        ) {
-          res.status(400).json({
-            code: 'INVALID_CATEGORY',
-            error: 'Please choose Brain MRI, Muscle MRI, or Soft Tissue MRI.',
-          });
-          return;
-        }
-
-        const patientContext = extractPatientContext(
-          req.body as Record<string, unknown>,
-          req.authUser!.fullName,
-        );
-        const analysis = await analyzeMedicalImage({
-          fileBuffer: file.buffer,
-          mimeType: detectedMime,
-          subType: rawSubType,
-          patientContext,
-        });
-
-        const reportId = saveEncryptedReport({
-          userId: req.authUser!.id,
-          moduleType: 'mri',
-          subType: rawSubType,
-          patientContext,
-          fileName: file.originalname,
-          mimeType: detectedMime,
-          fileBuffer: file.buffer,
-          analysis,
-        });
-
-        res.status(201).json({ reportId, analysis });
-      } catch (error) {
-        sendAnalysisError(res, 'MRI Analysis', error);
+      let extractedPdfText = String(req.body?.extractedPdfText || '').trim();
+      if (validated.mimeType === 'application/pdf' && !extractedPdfText) {
+        extractedPdfText = await extractPdfTextServer(validated.buffer);
       }
-    },
-  );
+
+      const analysis = await analyzeBloodReport({
+        fileBuffer: validated.buffer,
+        mimeType: validated.mimeType,
+        extractedPdfText,
+        patientContext,
+      });
+
+      const reportId = saveEncryptedReport({
+        userId: req.authUser!.id,
+        moduleType: 'blood',
+        subType: 'blood_panel',
+        patientContext,
+        fileName: validated.safeName,
+        mimeType: validated.mimeType,
+        fileBuffer: validated.buffer,
+        analysis,
+      });
+
+      res.status(201).json({
+        success: true,
+        analysisId: reportId,
+        reportId,
+        reportType: 'blood',
+        category: 'blood_panel',
+        status: 'completed',
+        analysis,
+        results: formatStandardResults(analysis),
+        medicalDisclaimer: MEDICAL_DISCLAIMER,
+      });
+    } catch (error) {
+      sendAnalysisError(res, 'Blood Analysis', error);
+    } finally {
+      if (lockKey) releaseInFlightLock(lockKey);
+    }
+  };
+
+  const handleXrayAnalysis = async (req: AuthedRequest, res: Response) => {
+    let lockKey: string | null = null;
+    try {
+      const validated = validateUploadedMedicalFile(req.file, ['image/jpeg', 'image/png']);
+
+      const rawSubType = String(req.body?.subType || req.body?.category || '');
+      const normalizedSubType =
+        rawSubType === 'bone' || rawSubType === 'bone_xray'
+          ? 'bone_xray'
+          : rawSubType === 'chest' || rawSubType === 'chest_xray'
+            ? 'chest_xray'
+            : null;
+
+      if (!normalizedSubType) {
+        res.status(400).json({
+          code: 'INVALID_CATEGORY',
+          error: 'Please choose either Bone X-ray or Chest X-ray.',
+        });
+        return;
+      }
+
+      if (!isAiConfigured()) {
+        res.status(503).json({
+          code: 'AI_NOT_CONFIGURED',
+          error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
+        });
+        return;
+      }
+
+      lockKey = `${req.authUser!.id}:${normalizedSubType}:${validated.sha256}`;
+      if (!acquireInFlightLock(lockKey)) {
+        res.status(409).json({
+          code: 'DUPLICATE_REQUEST',
+          error: 'This exact X-ray image is already being analyzed. Please wait for it to complete.',
+        });
+        return;
+      }
+
+      const patientContext = extractPatientContext(
+        req.body as Record<string, unknown>,
+        req.authUser!.fullName,
+      );
+
+      const analysis = await analyzeMedicalImage({
+        fileBuffer: validated.buffer,
+        mimeType: validated.mimeType,
+        subType: normalizedSubType,
+        patientContext,
+      });
+
+      const reportId = saveEncryptedReport({
+        userId: req.authUser!.id,
+        moduleType: 'xray',
+        subType: normalizedSubType,
+        patientContext,
+        fileName: validated.safeName,
+        mimeType: validated.mimeType,
+        fileBuffer: validated.buffer,
+        analysis,
+      });
+
+      res.status(201).json({
+        success: true,
+        analysisId: reportId,
+        reportId,
+        reportType: 'xray',
+        category: normalizedSubType === 'bone_xray' ? 'bone' : 'chest',
+        status: 'completed',
+        analysis,
+        results: formatStandardResults(analysis),
+        medicalDisclaimer: MEDICAL_DISCLAIMER,
+      });
+    } catch (error) {
+      sendAnalysisError(res, 'X-ray Analysis', error);
+    } finally {
+      if (lockKey) releaseInFlightLock(lockKey);
+    }
+  };
+
+  const handleMriAnalysis = async (req: AuthedRequest, res: Response) => {
+    let lockKey: string | null = null;
+    try {
+      const validated = validateUploadedMedicalFile(req.file, ['image/jpeg', 'image/png']);
+
+      const rawSubType = String(req.body?.subType || req.body?.category || '');
+      const normalizedSubType =
+        rawSubType === 'brain' || rawSubType === 'brain_mri'
+          ? 'brain_mri'
+          : rawSubType === 'muscle' || rawSubType === 'muscle_mri'
+            ? 'muscle_mri'
+            : rawSubType === 'soft_tissue' || rawSubType === 'soft_tissue_mri'
+              ? 'soft_tissue_mri'
+              : null;
+
+      if (!normalizedSubType) {
+        res.status(400).json({
+          code: 'INVALID_CATEGORY',
+          error: 'Please choose Brain MRI, Muscle MRI, or Soft Tissue MRI.',
+        });
+        return;
+      }
+
+      if (!isAiConfigured()) {
+        res.status(503).json({
+          code: 'AI_NOT_CONFIGURED',
+          error: 'Gemini AI service is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
+        });
+        return;
+      }
+
+      lockKey = `${req.authUser!.id}:${normalizedSubType}:${validated.sha256}`;
+      if (!acquireInFlightLock(lockKey)) {
+        res.status(409).json({
+          code: 'DUPLICATE_REQUEST',
+          error: 'This exact MRI scan is already being analyzed. Please wait for it to complete.',
+        });
+        return;
+      }
+
+      const patientContext = extractPatientContext(
+        req.body as Record<string, unknown>,
+        req.authUser!.fullName,
+      );
+
+      const analysis = await analyzeMedicalImage({
+        fileBuffer: validated.buffer,
+        mimeType: validated.mimeType,
+        subType: normalizedSubType,
+        patientContext,
+      });
+
+      const reportId = saveEncryptedReport({
+        userId: req.authUser!.id,
+        moduleType: 'mri',
+        subType: normalizedSubType,
+        patientContext,
+        fileName: validated.safeName,
+        mimeType: validated.mimeType,
+        fileBuffer: validated.buffer,
+        analysis,
+      });
+
+      res.status(201).json({
+        success: true,
+        analysisId: reportId,
+        reportId,
+        reportType: 'mri',
+        category: normalizedSubType.replace('_mri', ''),
+        status: 'completed',
+        analysis,
+        results: formatStandardResults(analysis),
+        medicalDisclaimer: MEDICAL_DISCLAIMER,
+      });
+    } catch (error) {
+      sendAnalysisError(res, 'MRI Analysis', error);
+    } finally {
+      if (lockKey) releaseInFlightLock(lockKey);
+    }
+  };
+
+  app.post('/api/analyze/blood', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleBloodAnalysis);
+  app.post('/api/analysis/blood', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleBloodAnalysis);
+
+  app.post('/api/analyze/xray', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleXrayAnalysis);
+  app.post('/api/analysis/xray', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleXrayAnalysis);
+
+  app.post('/api/analyze/mri', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleMriAnalysis);
+  app.post('/api/analysis/mri', requireAuth, analysisRateLimiter, handleSingleFileUpload, handleMriAnalysis);
+
+  const handleGetTypedAnalysis = (expectedModule: ModuleType) => (req: AuthedRequest, res: Response) => {
+    const row = getOwnedReportOrError(req.params.id, req.authUser!.id, res, expectedModule);
+    if (!row) return;
+    const report = toReportRecord(row);
+    res.json({
+      success: true,
+      analysisId: report.id,
+      reportId: report.id,
+      reportType: report.moduleType,
+      category: report.subType,
+      status: 'completed',
+      report,
+      results: formatStandardResults(report.analysis),
+      medicalDisclaimer: MEDICAL_DISCLAIMER,
+    });
+  };
+
+  app.get('/api/analysis/blood/:id', requireAuth, handleGetTypedAnalysis('blood'));
+  app.get('/api/analysis/xray/:id', requireAuth, handleGetTypedAnalysis('xray'));
+  app.get('/api/analysis/mri/:id', requireAuth, handleGetTypedAnalysis('mri'));
 
   // Guarantee JSON error responses for all /api/* routes (never HTML)
   app.use('/api', (_req, res) => {
@@ -926,7 +980,7 @@ async function startServer(): Promise<void> {
 
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     if (req.path.startsWith('/api')) {
-      console.error('[API Error Middleware]', err);
+      console.error('[API Error Middleware]', err instanceof Error ? err.name : 'UnknownError');
       res.status(500).json({
         code: 'SERVER_ERROR',
         error: 'Unexpected server error occurred.',
@@ -936,7 +990,6 @@ async function startServer(): Promise<void> {
     next(err);
   });
 
-  // Vite dev middleware or production static assets
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

@@ -493,41 +493,52 @@ CRITICAL SAFETY RULES:
     );
 
     const parsed = parseJsonResponse(response.text);
-    return normalizeResult(parsed);
+    const normalized = normalizeResult(parsed);
+    if (!normalized.finalSummary) {
+      normalized.finalSummary =
+        'Review the extracted blood parameters above with your physician for clinical interpretation.';
+    }
+    if (normalized.limitations.length === 0) {
+      normalized.limitations.push(
+        'Educational AI summary only. Verify every extracted value and reference range against your official laboratory report.',
+      );
+    }
+    return normalized;
   } catch (err) {
-    console.error('[Gemini Blood Analysis Failure]', extractErrorDetails(err));
+    const details = extractErrorDetails(err);
+    console.error('[Gemini Blood Analysis Failure]', { status: details.status });
     throw mapGeminiError(err);
   }
 }
 
 const IMAGING_GUIDANCE: Record<Exclude<SubType, 'blood_panel'>, string> = {
   bone_xray: `Focus on Bone X-ray educational observation:
-- Evaluate visible cortical bone continuity and possible fracture lines or hairline irregularities.
-- Describe bone alignment and anatomical positioning.
-- Note visible joint spaces, joint margins, or arthritic/degenerative signs.
-- Note any visible focal bone density changes or osseous abnormalities.
-- Clearly state image-quality limitations (single view vs orthogonal views, exposure, cropping) and recommend formal orthopedic/radiologist review.`,
+- Visible bone alignment and anatomical positioning.
+- Obvious displaced fractures or gross cortical bone continuity disruptions (clearly state that hairline/occult fractures cannot be ruled out).
+- Joint appearance, visible joint spaces, and cortical margins.
+- Image limitations (single projection, cropping, exposure, lack of orthogonal views).
+- NEVER claim the X-ray is normal simply because no obvious abnormality is seen; always recommend formal radiologist interpretation.`,
   chest_xray: `Focus on Chest X-ray educational observation:
-- Evaluate visible lung field clarity, aeration, and symmetry.
-- Comment on the cardiac silhouette / apparent heart size (noting AP vs PA projection limitations).
-- Check visible costophrenic angles and pleural spaces for potential fluid blunting or effusions.
-- Note any visible opacities, infiltrates, or signs that could warrant evaluation for infection or inflammation.
-- Clearly state projection/exposure limitations and recommend formal radiologist review.`,
+- Visible ribs, clavicles, and thoracic spine alignment.
+- Lung fields appearance and symmetry.
+- Heart silhouette and mediastinal appearance (noting AP vs PA projection limitations).
+- Visible focal opacities, pleural blunting, or abnormalities.
+- NEVER claim the X-ray is normal simply because no abnormality is identified, and NEVER rule out fractures, tumors, or infections; recommend formal radiologist interpretation.`,
   brain_mri: `Focus on Brain MRI educational observation:
-- Identify visible brain structures (cerebral hemispheres, ventricles, midline symmetry, sulci, brainstem/cerebellum if visible).
-- Note any visible signal asymmetries, focal hyperintensities/hypointensities, mass effect, or structural variations.
-- Explain what MRI contrast/signal patterns mean in simple language.
-- Explicitly emphasize that a single 2D MRI image cannot replace a full multi-sequence DICOM study read by a neuroradiologist.`,
+- Visible brain structures (cerebral hemispheres, ventricles, midline symmetry, sulci, brainstem/cerebellum if in slice).
+- Visible signal asymmetries or structural variations.
+- Explain in plain language why a single exported MRI image is NOT equivalent to a complete multi-sequence MRI study.
+- NEVER claim reliable detection or exclusion of brain lesions, tumors, strokes, or neurological conditions from one image; state that complete MRI studies require clinically validated DICOM processing preserving sequence metadata and neuroradiologist review.`,
   muscle_mri: `Focus on Muscle MRI educational observation:
-- Describe visible skeletal muscle compartments, fascial planes, and symmetry.
-- Look for visible signal brightness/edema patterns, fiber discontinuity, or strain/tear appearances.
-- Explain findings in clear, accessible language.
-- Explicitly emphasize single-image/slice limitations and recommend musculoskeletal radiologist review.`,
+- Visible skeletal muscle compartments, fascial planes, and symmetry.
+- Visible signal brightness/edema patterns or contour irregularities.
+- Explain in plain language why a single exported MRI image cannot replace a multi-plane T1/T2/STIR study.
+- NEVER claim reliable diagnosis of muscle tears, nerve injuries, or soft-tissue masses from one image; recommend formal musculoskeletal radiologist and DICOM study review.`,
   soft_tissue_mri: `Focus on Soft Tissue MRI educational observation:
-- Describe visible subcutaneous, tendon, ligament, bursa, or soft tissue planes.
-- Note any visible fluid collections, localized swelling, mass-like signal changes, or tendon/ligament contour irregularities.
-- Explain observations in plain language.
-- Explicitly emphasize that single-image uploads lack multi-plane T1/T2/STIR volumetric context and require radiologist evaluation.`,
+- Visible subcutaneous, tendon, ligament, bursa, or soft tissue planes.
+- Visible localized fluid signal or contour changes.
+- Explain in plain language why one exported MRI slice lacks multi-sequence volumetric context.
+- NEVER claim reliable diagnosis of soft-tissue tumors, nerve injuries, or ligament tears from one image; recommend formal radiologist and DICOM study review.`,
 };
 
 export async function analyzeMedicalImage(params: {
@@ -549,11 +560,12 @@ export async function analyzeMedicalImage(params: {
   const systemInstruction = `You are MediScan AI, a cautious, educational medical imaging explainer.
 CRITICAL SAFETY & CLINICAL BOUNDARY RULES:
 1. You are a general multimodal AI model providing EDUCATIONAL OBSERVATIONS ONLY — NOT a clinically validated radiological diagnostic device.
-2. NEVER claim to detect or rule out every fracture, tumor, hemorrhage, tear, infection, or disease. Always communicate appropriate uncertainty.
-3. Recommend professional review by a board-certified radiologist or qualified physician for every scan, especially for any flagged or unclear finding.
-4. If the uploaded image is NOT a medical ${modalityLabel}, or is severely blurred, cropped, dark, or low-resolution, clearly report that in qualityAssessment and limitations without inventing anatomical findings.
-5. ${IMAGING_GUIDANCE[params.subType]}
-6. Assign conservative confidence ("high", "moderate", "low") per observation and classify status as "normal" (no gross visual abnormality seen on this view), "attention" (borderline, suboptimal image quality, or uncertain area needing specialist verification), or "abnormal" (notable visual irregularity requiring prompt medical review).`;
+2. NEVER claim that a scan is definitively normal simply because you do not identify an abnormality. NEVER claim to detect or rule out every fracture, tumor, lesion, nerve injury, infection, or disease.
+3. Do NOT present model confidence levels as clinically validated diagnostic probabilities.
+4. Recommend formal interpretation by a board-certified radiologist or qualified physician for every scan.
+5. If the uploaded image is NOT a medical ${modalityLabel}, or is severely blurred, cropped, dark, or low-resolution, clearly report that in qualityAssessment and limitations without inventing anatomical findings.
+6. ${IMAGING_GUIDANCE[params.subType]}
+7. Assign conservative observational certainty ("high", "moderate", "low") and status ("normal" for no gross visual irregularity noted on this limited educational view, "attention" for borderline/uncertain/quality-limited areas, "abnormal" for notable visual irregularity needing prompt clinician review).`;
 
   const contextSummary = [
     `Scan Category: ${params.subType.replace('_', ' ').toUpperCase()}`,
@@ -573,7 +585,7 @@ CRITICAL SAFETY & CLINICAL BOUNDARY RULES:
   };
 
   const textPart = {
-    text: `Examine this uploaded ${modalityLabel} image carefully for educational explanation. Provide structured anatomical observations with confidence levels, normal vs flagged findings, simple-language explanation, image quality evaluation, explicit AI & single-image limitations, precautions, and an overall summary.\n\n${contextSummary}`,
+    text: `Examine this uploaded ${modalityLabel} image carefully for educational explanation. Provide structured anatomical observations, normal vs flagged findings, simple-language explanation, image quality evaluation, explicit AI & single-image limitations, precautions, and an overall summary.\n\n${contextSummary}`,
   };
 
   try {
@@ -590,9 +602,20 @@ CRITICAL SAFETY & CLINICAL BOUNDARY RULES:
     );
 
     const parsed = parseJsonResponse(response.text);
-    return normalizeResult(parsed);
+    const normalized = normalizeResult(parsed);
+    if (!normalized.finalSummary) {
+      normalized.finalSummary =
+        'Educational visual observations generated. Formal interpretation by a board-certified radiologist is required.';
+    }
+    if (normalized.limitations.length === 0) {
+      normalized.limitations.push(
+        'General-purpose AI vision observations cannot rule out fractures, lesions, infections, or other medical conditions. Always obtain formal radiologist review.',
+      );
+    }
+    return normalized;
   } catch (err) {
-    console.error(`[Gemini Imaging Analysis Failure:${params.subType}]`, extractErrorDetails(err));
+    const details = extractErrorDetails(err);
+    console.error(`[Gemini Imaging Analysis Failure:${params.subType}]`, { status: details.status });
     throw mapGeminiError(err);
   }
 }
